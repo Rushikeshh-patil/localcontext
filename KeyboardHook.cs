@@ -19,6 +19,13 @@ namespace LocalContextBuilder
         private System.Timers.Timer _typingTimer;
         private bool _isPaused = false;
         private bool _shiftPressed = false;
+        private volatile bool _hasActiveSuggestion = false;
+
+        public bool HasActiveSuggestion
+        {
+            get => _hasActiveSuggestion;
+            set => _hasActiveSuggestion = value;
+        }
 
         public event Action<string>? OnPauseTyping;
         public event Action? OnTyping;
@@ -27,14 +34,22 @@ namespace LocalContextBuilder
         public KeyboardHook()
         {
             _proc = HookCallback;
-            _typingTimer = new System.Timers.Timer(400); // 400ms pause
+            _typingTimer = new System.Timers.Timer(600); // 600ms pause
             _typingTimer.Elapsed += TypingTimer_Elapsed;
             _typingTimer.AutoReset = false;
+        }
+
+        private static void Log(string msg)
+        {
+            System.IO.File.AppendAllText(
+                System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "app_debug.log"),
+                DateTime.Now.ToString("HH:mm:ss.fff") + " [HOOK] " + msg + "\n");
         }
 
         public void Start()
         {
             _hookID = SetHook(_proc);
+            Log($"Hook installed: {_hookID}");
         }
 
         public void Stop()
@@ -83,8 +98,20 @@ namespace LocalContextBuilder
                     }
                     else if (vkCode == 0x09) // Tab
                     {
-                        if (OnAcceptSuggestion != null) OnAcceptSuggestion();
-                        return (IntPtr)1; // Block tab
+                        Log($"Tab pressed. HasActiveSuggestion={_hasActiveSuggestion}");
+                        if (_hasActiveSuggestion)
+                        {
+                            if (OnAcceptSuggestion != null) OnAcceptSuggestion();
+                            return (IntPtr)1; // Block tab only when suggestion is visible
+                        }
+                        // Otherwise let Tab pass through normally
+                    }
+                    else if (vkCode == 0x1B) // Escape - dismiss suggestion
+                    {
+                        if (_hasActiveSuggestion)
+                        {
+                            if (OnTyping != null) OnTyping();
+                        }
                     }
                     else if (vkCode == 0x08) // Backspace
                     {
@@ -138,14 +165,19 @@ namespace LocalContextBuilder
             }
             if (vkCode == 0x20) return ' ';
             if (vkCode == 0x0D) return '\n';
-            // Basic mapping, can be expanded
+            if (vkCode == 0xBE) return '.';
+            if (vkCode == 0xBC) return ',';
+            if (vkCode == 0xBF) return '?';
+            if (vkCode == 0xBA) return ';';
+            if (vkCode == 0xDE) return '\'';
             return '\0';
         }
 
         public static void InjectText(string text)
         {
             if (string.IsNullOrEmpty(text)) return;
-            
+            Log($"InjectText called: '{text}' ({text.Length} chars)");
+
             INPUT[] inputs = new INPUT[text.Length * 2];
             for (int i = 0; i < text.Length; i++)
             {
@@ -160,6 +192,8 @@ namespace LocalContextBuilder
                             wVk = 0,
                             wScan = (ushort)c,
                             dwFlags = 0x0004, // KEYEVENTF_UNICODE
+                            time = 0,
+                            dwExtraInfo = IntPtr.Zero
                         }
                     }
                 };
@@ -173,11 +207,17 @@ namespace LocalContextBuilder
                             wVk = 0,
                             wScan = (ushort)c,
                             dwFlags = 0x0004 | 0x0002, // UNICODE | KEYUP
+                            time = 0,
+                            dwExtraInfo = IntPtr.Zero
                         }
                     }
                 };
             }
-            SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+            int structSize = Marshal.SizeOf(typeof(INPUT));
+            Log($"SendInput: {inputs.Length} events, struct size={structSize}");
+            uint result = SendInput((uint)inputs.Length, inputs, structSize);
+            int err = Marshal.GetLastWin32Error();
+            Log($"SendInput result: {result} sent, error={err}");
         }
 
         // --- P/Invoke Definitions ---
@@ -197,6 +237,8 @@ namespace LocalContextBuilder
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
+        // Correct struct layout for x64 compatibility.
+        // The union MUST include MOUSEINPUT (the largest member) for proper size calculation.
         [StructLayout(LayoutKind.Sequential)]
         struct INPUT
         {
@@ -208,7 +250,22 @@ namespace LocalContextBuilder
         struct InputUnion
         {
             [FieldOffset(0)]
+            public MOUSEINPUT mi;
+            [FieldOffset(0)]
             public KEYBDINPUT ki;
+            [FieldOffset(0)]
+            public HARDWAREINPUT hi;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct MOUSEINPUT
+        {
+            public int dx;
+            public int dy;
+            public uint mouseData;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -219,6 +276,14 @@ namespace LocalContextBuilder
             public uint dwFlags;
             public uint time;
             public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct HARDWAREINPUT
+        {
+            public uint uMsg;
+            public ushort wParamL;
+            public ushort wParamH;
         }
     }
 }

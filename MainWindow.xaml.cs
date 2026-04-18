@@ -1,6 +1,8 @@
 using System;
 using System.Windows;
 using System.Windows.Threading;
+using System.Windows.Forms;
+using System.Drawing;
 
 namespace LocalContextBuilder
 {
@@ -9,11 +11,42 @@ namespace LocalContextBuilder
         private LlmService _llmService;
         private KeyboardHook _keyboardHook;
         private string _currentSuggestion = "";
+        private NotifyIcon _notifyIcon;
+        private AppSettings _settings;
 
         public MainWindow()
         {
             InitializeComponent();
             this.Loaded += MainWindow_Loaded;
+            
+            _settings = AppSettings.Load();
+            SetupTrayIcon();
+        }
+
+        private void SetupTrayIcon()
+        {
+            _notifyIcon = new NotifyIcon();
+            _notifyIcon.Icon = SystemIcons.Application;
+            _notifyIcon.Visible = true;
+            _notifyIcon.Text = "Local Context Builder";
+
+            var contextMenu = new ContextMenuStrip();
+            contextMenu.Items.Add("Settings", null, (s, e) => ShowSettings());
+            contextMenu.Items.Add(new ToolStripSeparator());
+            contextMenu.Items.Add("Exit", null, (s, e) => System.Windows.Application.Current.Shutdown());
+
+            _notifyIcon.ContextMenuStrip = contextMenu;
+        }
+
+        private void ShowSettings()
+        {
+            var settingsWindow = new SettingsWindow(_settings);
+            if (settingsWindow.ShowDialog() == true)
+            {
+                Log("Settings updated, restarting server...");
+                _llmService.Cleanup();
+                _llmService.StartServer(_settings);
+            }
         }
 
         private void Log(string msg)
@@ -25,7 +58,7 @@ namespace LocalContextBuilder
         {
             Log("App Loaded");
             _llmService = new LlmService();
-            _llmService.StartServer(@"C:\Users\rush\.ollama\models\gemma-4-E4B-it-UD-Q8_K_XL.gguf");
+            _llmService.StartServer(_settings);
             Log("LLM Service Started");
 
             _keyboardHook = new KeyboardHook();
@@ -47,6 +80,7 @@ namespace LocalContextBuilder
                 {
                     MainBorder.Visibility = Visibility.Hidden;
                     _currentSuggestion = "";
+                    _keyboardHook.HasActiveSuggestion = false;
                 }
             });
         }
@@ -93,6 +127,8 @@ namespace LocalContextBuilder
                     }
                     
                     MainBorder.Visibility = Visibility.Visible;
+                    _keyboardHook.HasActiveSuggestion = true;
+                    Log($"SUGGESTION SHOWN: '{suggestion}'");
                 });
             }
         }
@@ -104,8 +140,10 @@ namespace LocalContextBuilder
                 if (MainBorder.Visibility == Visibility.Visible && !string.IsNullOrEmpty(_currentSuggestion))
                 {
                     string textToInject = _currentSuggestion;
+                    Log($"ACCEPTED: '{textToInject}'");
                     MainBorder.Visibility = Visibility.Hidden;
                     _currentSuggestion = "";
+                    _keyboardHook.HasActiveSuggestion = false;
                     
                     _keyboardHook.Pause();
                     KeyboardHook.InjectText(textToInject);
@@ -116,6 +154,7 @@ namespace LocalContextBuilder
 
         protected override void OnClosed(EventArgs e)
         {
+            if (_notifyIcon != null) _notifyIcon.Dispose();
             if (_keyboardHook != null) _keyboardHook.Stop();
             if (_llmService != null) _llmService.Cleanup();
             base.OnClosed(e);

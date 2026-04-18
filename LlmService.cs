@@ -20,14 +20,13 @@ namespace LocalContextBuilder
             _httpClient.Timeout = TimeSpan.FromSeconds(10);
         }
 
-        public void StartServer(string modelPath)
+        public void StartServer(AppSettings settings)
         {
             string baseDir = AppDomain.CurrentDomain.BaseDirectory;
             string serverExePath = Path.Combine(baseDir, "llama-server.exe");
             
             if (!File.Exists(serverExePath))
             {
-                // Fallback to searching up the tree in the Release folder
                 string fallbackPath = Path.GetFullPath(Path.Combine(baseDir, @"..\..\..\Release\llama-server.exe"));
                 if (File.Exists(fallbackPath))
                 {
@@ -35,29 +34,50 @@ namespace LocalContextBuilder
                 }
                 else
                 {
-                    Console.WriteLine("llama-server.exe not found in " + serverExePath + " or " + fallbackPath);
+                    Log("llama-server.exe not found.");
                     return; 
                 }
             }
 
             try
             {
+                string arguments = $"-m \"{settings.ModelPath}\" -c {settings.ContextSize} --host 127.0.0.1 --port 8080";
+                
+                if (settings.UseNpu)
+                {
+                    // For Intel NPU via OpenVINO, usually it's -ngl 0 or specific device flags
+                    // We'll assume the user has an OpenVINO build of llama-cpp
+                    arguments += " -ngl 0"; 
+                }
+                else
+                {
+                    arguments += $" -ngl {settings.GpuLayers}";
+                }
+
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
                     FileName = serverExePath,
-                    Arguments = $"-m \"{modelPath}\" -ngl 999 -c 4096 --host 127.0.0.1 --port 8080", // Increased context for OCR
+                    Arguments = arguments,
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true
                 };
 
+                Log($"Starting server with args: {arguments}");
                 _serverProcess = Process.Start(psi);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Failed to start llama-server: {ex.Message}");
+                Log($"Failed to start llama-server: {ex.Message}");
             }
+        }
+
+        private void Log(string msg)
+        {
+            System.IO.File.AppendAllText(
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "app_debug.log"),
+                DateTime.Now.ToString("HH:mm:ss.fff") + " [LLM] " + msg + "\n");
         }
 
         public async Task<string?> GenerateSuggestion(string typedContext, string screenContext)
@@ -69,53 +89,54 @@ namespace LocalContextBuilder
                     screenContext = screenContext.Substring(0, 2000) + "...";
                 }
 
-                string prompt = $@"You are a fast autocomplete predictive typing assistant.
-Below is the text currently visible on the user's screen for context:
----
-{screenContext}
----
+                // Use Gemma's native instruct format with the raw /completion endpoint.
+                // The /v1/chat/completions endpoint triggers Gemma 4's thinking mode
+                // which wastes all tokens on internal reasoning and returns empty content.
+                string screenSection = string.IsNullOrWhiteSpace(screenContext)
+                    ? ""
+                    : $"\nFor reference, here is some background text from the screen (DO NOT repeat this):\n{screenContext}\n";
 
-The user has just typed the following:
-""{typedContext}""
-
-Predict exactly the next 3 to 5 words to complete their sentence. DO NOT include the text they already typed. DO NOT add quotes or explanations. JUST the predicted continuation.";
+                string gemmaPrompt = $"<start_of_turn>user\nComplete the partial sentence below with the most likely next 3-5 words. Rules:\n- Output ONLY the continuation words\n- Do NOT repeat any text the user already typed\n- Do NOT include UI elements, menus, or labels\n- Do NOT use quotes or formatting{screenSection}\nPartial sentence to complete: \"{typedContext}\"\n<end_of_turn>\n<start_of_turn>model\n";
 
                 var payload = new
                 {
-                    messages = new[]
-                    {
-                        new { role = "user", content = prompt }
-                    },
-                    max_tokens = 10,
-                    temperature = 0.2,
-                    stop = new[] { "\n", "\r" }
+                    prompt = gemmaPrompt,
+                    n_predict = 15,
+                    temperature = 0.3,
+                    stop = new[] { "<end_of_turn>", "<start_of_turn>", "<|", "\n" }
                 };
 
                 string jsonPayload = JsonSerializer.Serialize(payload);
-                var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+                Log($"Sending to /completion, typed={typedContext.Length}chars, screen={screenContext.Length}chars");
 
-                HttpResponseMessage response = await _httpClient.PostAsync($"{_serverUrl}/v1/chat/completions", content);
+                var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+                HttpResponseMessage response = await _httpClient.PostAsync($"{_serverUrl}/completion", content);
+
+                string jsonResponse = await response.Content.ReadAsStringAsync();
+                Log($"HTTP {(int)response.StatusCode}: {jsonResponse.Substring(0, Math.Min(300, jsonResponse.Length))}");
+
                 if (response.IsSuccessStatusCode)
                 {
-                    string jsonResponse = await response.Content.ReadAsStringAsync();
                     using (JsonDocument doc = JsonDocument.Parse(jsonResponse))
                     {
-                        var choices = doc.RootElement.GetProperty("choices");
-                        if (choices.GetArrayLength() > 0)
+                        if (doc.RootElement.TryGetProperty("content", out JsonElement contentElement))
                         {
-                            var message = choices[0].GetProperty("message");
-                            if (message.TryGetProperty("content", out JsonElement contentElement))
+                            string suggestion = contentElement.GetString()?.Trim() ?? "";
+                            // Filter out any remaining junk tokens
+                            if (suggestion.Contains("<|") || suggestion.Contains("<start_of_turn>"))
                             {
-                                string suggestion = contentElement.GetString()?.Trim() ?? "";
-                                return suggestion;
+                                Log($"Filtered junk suggestion: {suggestion}");
+                                return null;
                             }
+                            Log($"Clean suggestion: '{suggestion}'");
+                            return string.IsNullOrWhiteSpace(suggestion) ? null : suggestion;
                         }
                     }
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // Server might not be ready
+                Log($"ERROR: {ex.Message}");
             }
             return null;
         }

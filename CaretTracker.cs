@@ -6,7 +6,7 @@ namespace LocalContextBuilder
 {
     public static class CaretTracker
     {
-        public static Point? GetCaretPosition()
+        public static System.Windows.Point? GetCaretPosition()
         {
             try
             {
@@ -24,7 +24,7 @@ namespace LocalContextBuilder
                             if (rects != null && rects.Length > 0)
                             {
                                 Rect caretRect = rects[0];
-                                return new Point(caretRect.Right, caretRect.Bottom);
+                                return new System.Windows.Point(caretRect.Right, caretRect.Bottom);
                             }
                         }
                     }
